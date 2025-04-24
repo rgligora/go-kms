@@ -1,2 +1,7 @@
+.idea/
 .DS_Store
+bin/
 docs/
+.envrc
+secrets/
+

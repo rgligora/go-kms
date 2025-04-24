@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  go-kms:
+    image: rgligora/go-kms:latest
+    container_name: go-kms
+    ports:
+      - "8443:8443"
+    environment:
+      - KMS_ENV=prod
+      - KMS_DATABASE_DSN=/var/lib/go-kms/prod.db
+    volumes:
+      - ./data/prod.db:/var/lib/go-kms/prod.db           # persistent SQLite
+    secrets:
+      - server_cert
+      - server_key
+      - ca_cert
+      - master_passphrase
+    configs:
+      - source: prod_config
+        target: /etc/go-kms/config.prod.yaml             # mount your prod config
+
+    # (Optional) if your image ENTRYPOINT is the binary, no command needed:
+    # command: ["./go-kms"]
+
+secrets:
+  server_cert:
+    file: ./secrets/server.crt
+  server_key:
+    file: ./secrets/server.key
+  ca_cert:
+    file: ./secrets/ca.pem
+  master_passphrase:
+    file: ./secrets/master.key
+
+configs:
+  prod_config:
+    file: ./config/config.prod.yaml

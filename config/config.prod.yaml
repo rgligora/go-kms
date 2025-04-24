@@ -1,0 +1,11 @@
+server:
+  port: 8443
+  serverCert: "/run/secrets/server_cert"    # Docker secret mount
+  serverKey:  "/run/secrets/server_key"     # Docker secret mount
+  caCert:     "/run/secrets/ca_cert"        # Docker secret mount
+
+kms:
+  master_passphrase_file: "/run/secrets/master_passphrase"  # Docker secret mount
+
+database:
+  dsn: "/var/lib/go-kms/prod.db"            # file-backed SQLite

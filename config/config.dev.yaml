@@ -1,0 +1,12 @@
+server:
+  port: 8080
+  serverCert: "./secrets/server.crt"
+  serverKey: "./secrets/server.key"
+  caCert: "./secrets/ca.pem"
+
+kms:
+  master_passphrase_file: "./secrets/master.key"
+
+
+database:
+  dsn: "dev.db"
