@@ -272,4 +272,8 @@ secrets:
 
 ---
 
-*© 2025 Your Organization. All rights reserved.*
+## License
+
+This software is licensed under the PolyForm Noncommercial License 1.0.0.  
+You may use, modify, and distribute it, but **not** for any commercial purpose.  
+See [LICENSE](PolyForm-Noncommercial-1.0.0.txt) for full terms.
