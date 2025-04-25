@@ -3,9 +3,17 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"time"
 )
 
 var ErrNotFound = errors.New("record not found")
+
+// KeyVersion represents one version of a wrapped DEK.
+type KeyVersion struct {
+	Version   int
+	Wrapped   []byte
+	CreatedAt time.Time
+}
 
 // MetadataStore defines operations for storing and retrieving KMS metadata.
 type MetadataStore interface {
@@ -19,9 +27,13 @@ type MetadataStore interface {
 // SecretStore defines operations for storing wrapped DEKs and other secrets.
 type SecretStore interface {
 	// StoreWrappedKey saves or updates a wrapped data-encryption key (DEK) by ID.
-	StoreWrappedKey(keyID string, wrapped []byte) error
+	StoreWrappedKey(keyID string, version int, wrapped []byte) error
 	// LoadWrappedKey retrieves the wrapped DEK for the given ID.
-	LoadWrappedKey(keyID string) ([]byte, error)
+	LoadWrappedKey(keyID string) (key []KeyVersion, err error)
+	// LoadLatestWrappedKey retrieves the latest wrapped DEK for the given ID.
+	LoadLatestWrappedKey(keyID string) (wrapped []byte, version int, err error)
+	// LoadWrappedKeyVersion retrieves the specific version of the wrapped DEK
+	LoadWrappedKeyVersion(keyID string, version int) ([]byte, error)
 	// DeleteWrappedKey deletes the wrapped DEK associated with the given ID.
 	DeleteWrappedKey(keyID string) error
 	// ListKeyIDs returns all stored key IDs.
@@ -65,21 +77,68 @@ func (s *SQLiteStore) SetMasterKeySalt(salt []byte) error {
 	return err
 }
 
-// StoreWrappedKey saves or updates a wrapped DEK in the keys table.
-func (s *SQLiteStore) StoreWrappedKey(keyID string, wrapped []byte) error {
-	_, err := s.db.Exec(
-		"INSERT INTO "+keysTable+"(key_id, wrapped_key) VALUES(?, ?) ON CONFLICT(key_id) DO UPDATE SET wrapped_key = excluded.wrapped_key",
-		keyID, wrapped,
-	)
+// StoreWrappedKey saves or updates a wrapped DEK in the keys_version table.
+func (s *SQLiteStore) StoreWrappedKey(keyID string, version int, wrapped []byte) error {
+	_, err := s.db.Exec(`
+      INSERT INTO keys (key_id, version, wrapped_key)
+           VALUES (?, ?, ?)
+      ON CONFLICT(key_id, version) DO UPDATE
+        SET wrapped_key = excluded.wrapped_key
+    `, keyID, version, wrapped)
 	return err
 }
 
-// LoadWrappedKey retrieves the wrapped DEK for a given key ID.
-func (s *SQLiteStore) LoadWrappedKey(keyID string) ([]byte, error) {
+// LoadWrappedKey loads *all* versions for a given key ID.
+func (s *SQLiteStore) LoadWrappedKey(keyID string) ([]KeyVersion, error) {
+	rows, err := s.db.Query(`
+      SELECT version, wrapped_key, created_at
+        FROM keys
+       WHERE key_id = ?
+    ORDER BY version
+    `, keyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []KeyVersion
+	for rows.Next() {
+		var kv KeyVersion
+		if err := rows.Scan(&kv.Version, &kv.Wrapped, &kv.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, kv)
+	}
+	if len(out) == 0 {
+		return nil, ErrNotFound
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) LoadLatestWrappedKey(keyID string) ([]byte, int, error) {
 	var wrapped []byte
-	err := s.db.QueryRow(
-		"SELECT wrapped_key FROM "+keysTable+" WHERE key_id = ?", keyID,
-	).Scan(&wrapped)
+	var version int
+	err := s.db.QueryRow(`
+      SELECT wrapped_key, version
+        FROM keys
+       WHERE key_id = ?
+    ORDER BY version DESC
+       LIMIT 1
+    `, keyID).Scan(&wrapped, &version)
+	if err == sql.ErrNoRows {
+		return nil, 0, ErrNotFound
+	}
+	return wrapped, version, err
+}
+
+// LoadWrappedKeyVersion retrieves a specific version of the wrapped DEK.
+func (s *SQLiteStore) LoadWrappedKeyVersion(keyID string, version int) ([]byte, error) {
+	var wrapped []byte
+	err := s.db.QueryRow(`
+      SELECT wrapped_key
+        FROM keys
+       WHERE key_id = ? AND version = ?
+    `, keyID, version).Scan(&wrapped)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -88,13 +147,11 @@ func (s *SQLiteStore) LoadWrappedKey(keyID string) ([]byte, error) {
 
 // DeleteWrappedKey deletes the wrapped DEK associated with the given key ID.
 func (s *SQLiteStore) DeleteWrappedKey(keyID string) error {
-	res, err := s.db.Exec(
-		"DELETE FROM "+keysTable+" WHERE key_id = ?", keyID,
-	)
+	res, err := s.db.Exec(`DELETE FROM keys WHERE key_id = ?`, keyID)
 	if err != nil {
 		return err
 	}
-	if count, _ := res.RowsAffected(); count == 0 {
+	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
 	return nil

@@ -16,7 +16,7 @@ func TestPBKDF2Deterministic(t *testing.T) {
 
 func TestWrapUnwrap(t *testing.T) {
 	master := DeriveMasterKey([]byte("p"), []byte("somesalt1234567"))
-	dek := []byte("this-is-32-byte-long-decryption-key!!")
+	dek := []byte("this-is-32-byte-long-master-key!!")
 	wrapped, err := WrapKey(master, dek)
 	if err != nil {
 		t.Fatalf("WrapKey error: %v", err)

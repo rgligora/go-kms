@@ -3,9 +3,11 @@ package handlers
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"github.com/rgligora/go-kms/internal/store"
 	"log"
 	"net/http"
-	"path"
+	"strings"
 
 	"github.com/rgligora/go-kms/internal/service"
 )
@@ -23,7 +25,7 @@ func NewHandler(svc *service.KMSService) *Handler {
 // RegisterRoutes registers KMS endpoints on the given ServeMux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/kms/keys", h.handleKeys)
-	mux.HandleFunc("/v1/kms/keys/", h.handleGetKeyByID)
+	mux.HandleFunc("/v1/kms/keys/", h.handleKeyByID)
 	mux.HandleFunc("/v1/kms/encrypt", h.handleEncrypt)
 	mux.HandleFunc("/v1/kms/decrypt", h.handleDecrypt)
 }
@@ -60,7 +62,7 @@ func (h *Handler) handleKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate the key
-	if err := h.Service.GenerateKey(req.KeyID); err != nil {
+	if err := h.Service.CreateKey(req.KeyID); err != nil {
 		JSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -73,32 +75,99 @@ func (h *Handler) handleKeys(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"key_id": req.KeyID})
 }
 
-// handleGetKeyByID handles GET /v1/kms/keys/{id} to return the wrapped key.
-func (h *Handler) handleGetKeyByID(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		JSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	// Extract key ID from URL
-	keyID := path.Base(r.URL.Path)
+// handleKeyByID handles:
+//
+//	GET    /v1/kms/keys/{keyID}
+//	DELETE /v1/kms/keys/{keyID}
+//	POST   /v1/kms/keys/{keyID}/rotate
+//	POST   /v1/kms/keys/{keyID}/recreate
+func (h *Handler) handleKeyByID(w http.ResponseWriter, r *http.Request) {
+	// Strip prefix + split
+	p := strings.TrimPrefix(r.URL.Path, "/v1/kms/keys/")
+	parts := strings.Split(p, "/")
+	keyID := parts[0]
 	if keyID == "" {
 		JSONError(w, http.StatusBadRequest, "key_id is required in path")
 		return
 	}
 
-	// Load wrapped key
-	wrapped, err := h.Service.GetWrappedKey(keyID)
-	if err != nil {
-		JSONError(w, http.StatusNotFound, err.Error())
+	// Decide which op
+	switch {
+	// ── GET wrapped key ───────────────────────────────────────────
+	case len(parts) == 1 && r.Method == http.MethodGet:
+		kvs, err := h.Service.GetWrappedKey(keyID)
+		if err != nil {
+			JSONError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		// build a response struct that includes version + wrapped blob
+		type versionResp struct {
+			Version int    `json:"version"`
+			Wrapped string `json:"wrapped"` // base64
+		}
+		out := make([]versionResp, 0, len(kvs))
+		for _, kv := range kvs {
+			out = append(out, versionResp{
+				Version: kv.Version,
+				Wrapped: base64.StdEncoding.EncodeToString(kv.Wrapped),
+			})
+		}
+		logRequest(r, "retrieved wrapped key versions: "+keyID)
+		w.Header().Set("Content-Type", "application/json")
+		// payload: { "key_versions": [ { "version":1, "wrapped":"..." }, ... ] }
+		json.NewEncoder(w).Encode(map[string]interface{}{"key_versions": out})
+		return
+
+	// ── DELETE key ─────────────────────────────────────────────────
+	case len(parts) == 1 && r.Method == http.MethodDelete:
+		if err := h.Service.DeleteKey(keyID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				JSONError(w, http.StatusNotFound, err.Error())
+			} else {
+				JSONError(w, http.StatusInternalServerError, err.Error())
+			}
+			return
+		}
+		logRequest(r, "deleted key: "+keyID)
+		w.WriteHeader(http.StatusNoContent)
+		return
+
+	// ── POST /rotate ─────────────────────────────────────────────
+	case len(parts) == 2 && parts[1] == "rotate" && r.Method == http.MethodPost:
+		err := h.Service.RotateKey(keyID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				logRequest(r, "rotate missing key: "+keyID)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			JSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		logRequest(r, "rotated key: "+keyID)
+		w.WriteHeader(http.StatusOK)
+		return
+
+	// ── POST /recreate ─────────────────────────────────────────────
+	case len(parts) == 2 && parts[1] == "recreate" && r.Method == http.MethodPost:
+		err := h.Service.RecreateKey(keyID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				logRequest(r, "recreate missing key: "+keyID)
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			JSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		logRequest(r, "recreated key: "+keyID)
+		w.WriteHeader(http.StatusCreated)
+		return
+
+	default:
+		JSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	// Base64-encode for JSON transport
-	enc := base64.StdEncoding.EncodeToString(wrapped)
-
-	logRequest(r, "retrieved wrapped key: "+keyID)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"wrapped_key": enc})
 }
 
 // handleEncrypt handles POST /v1/kms/encrypt

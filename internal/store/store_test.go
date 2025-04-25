@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"testing"
 
@@ -12,10 +13,25 @@ func setupStore(t *testing.T) *SQLiteStore {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE metadata(key TEXT PRIMARY KEY,value BLOB);`); err != nil {
+	// metadata table unchanged
+	if _, err := db.Exec(`
+      CREATE TABLE metadata(
+        key   TEXT PRIMARY KEY,
+        value BLOB NOT NULL
+      );
+    `); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE keys(key_id TEXT PRIMARY KEY, wrapped_key BLOB);`); err != nil {
+	// versioned keys table
+	if _, err := db.Exec(`
+      CREATE TABLE keys (
+        key_id      TEXT    NOT NULL,
+        version     INTEGER NOT NULL,
+        wrapped_key BLOB    NOT NULL,
+        created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (key_id, version)
+      );
+    `); err != nil {
 		t.Fatal(err)
 	}
 	return NewSQLiteStore(db)
@@ -36,4 +52,23 @@ func TestSaltRoundTrip(t *testing.T) {
 	}
 }
 
-// ... similarly for wrapped-key methods ...
+func TestStoreAndLoadAllVersions(t *testing.T) {
+	s := setupStore(t)
+	// write two versions
+	s.StoreWrappedKey("foo", 1, []byte("v1"))
+	s.StoreWrappedKey("foo", 2, []byte("v2"))
+
+	kvs, err := s.LoadWrappedKey("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kvs) != 2 {
+		t.Fatalf("expected 2 versions, got %d", len(kvs))
+	}
+	if kvs[0].Version != 1 || !bytes.Equal(kvs[0].Wrapped, []byte("v1")) {
+		t.Errorf("bad v1: %#v", kvs[0])
+	}
+	if kvs[1].Version != 2 || !bytes.Equal(kvs[1].Wrapped, []byte("v2")) {
+		t.Errorf("bad v2: %#v", kvs[1])
+	}
+}

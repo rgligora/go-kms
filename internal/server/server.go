@@ -75,7 +75,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 	// 6) Validate passphrase or master.key
 	const initKeyID = "__init__"
-	wrappedInit, err := sqlite.LoadWrappedKey(initKeyID)
+	wrappedInit, err := sqlite.LoadWrappedKeyVersion(initKeyID, 1)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, fmt.Errorf("loading init marker: %w", err)
 	}
@@ -86,7 +86,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("wrapping init marker: %w", err)
 		}
-		if err := sqlite.StoreWrappedKey(initKeyID, wrapped); err != nil {
+		if err := sqlite.StoreWrappedKey(initKeyID, 1, wrapped); err != nil {
 			return nil, fmt.Errorf("storing init marker: %w", err)
 		}
 	} else {
@@ -170,13 +170,16 @@ func ensureMetadataTable(db *sql.DB) error {
 	return err
 }
 
-// ensureKeysTable creates the keys table for wrapped DEKs if it doesn't exist
+// ensureKeyVersionsTable creates the key versions table for keys
 func ensureKeysTable(db *sql.DB) error {
 	const sqlStmt = `
-        CREATE TABLE IF NOT EXISTS keys (
-            key_id      TEXT PRIMARY KEY,
-            wrapped_key BLOB NOT NULL
-        );`
+		CREATE TABLE IF NOT EXISTS keys (
+			key_id      TEXT NOT NULL,
+			version     INTEGER NOT NULL,
+			wrapped_key BLOB  NOT NULL,
+			created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (key_id, version)
+		);`
 	_, err := db.Exec(sqlStmt)
 	return err
 }
