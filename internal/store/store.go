@@ -77,7 +77,7 @@ func (s *SQLiteStore) SetMasterKeySalt(salt []byte) error {
 	return err
 }
 
-// StoreWrappedKey saves or updates a wrapped DEK in the keys_version table.
+// StoreWrappedKey saves or updates a wrapped DEK in the keys table.
 func (s *SQLiteStore) StoreWrappedKey(keyID string, version int, wrapped []byte) error {
 	_, err := s.db.Exec(`
       INSERT INTO keys (key_id, version, wrapped_key)
