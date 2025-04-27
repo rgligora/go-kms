@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,11 +18,16 @@ import (
 	"github.com/rgligora/go-kms/internal/store"
 )
 
-// bootstrapIntegration now returns both the HTTP handler and the service
-func bootstrapIntegration(t *testing.T) (http.Handler, *service.KMSService) {
+const (
+	keyID     = "alpha"
+	purpose   = "encrypt"
+	algorithm = "AES-256-GCM"
+)
+
+// bootstrapIntegration returns an HTTP handler with an in-memory sqlite instance.
+func bootstrapIntegration(t *testing.T) http.Handler {
 	t.Helper()
 
-	// 1) In-memory SQLite with the right schema
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {
 		t.Fatalf("opening in-memory sqlite: %v", err)
@@ -32,11 +38,13 @@ func bootstrapIntegration(t *testing.T) (http.Handler, *service.KMSService) {
 			value BLOB NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS keys (
-			key_id      TEXT NOT NULL,
+			key_id      TEXT    NOT NULL,
+			purpose     TEXT    NOT NULL,
+			algorithm   TEXT    NOT NULL,
 			version     INTEGER NOT NULL,
 			wrapped_key BLOB    NOT NULL,
 			created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			PRIMARY KEY (key_id, version)
+			PRIMARY KEY (key_id, purpose, algorithm, version)
 		);`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -44,7 +52,6 @@ func bootstrapIntegration(t *testing.T) (http.Handler, *service.KMSService) {
 		}
 	}
 
-	// 2) Prepare store + salt + masterKey
 	st := store.NewSQLiteStore(db)
 	salt, err := cryptoutil.GenerateSalt()
 	if err != nil {
@@ -57,29 +64,26 @@ func bootstrapIntegration(t *testing.T) (http.Handler, *service.KMSService) {
 	masterKey := cryptoutil.DeriveMasterKey(passphrase, salt)
 	cryptoutil.Zeroize(passphrase)
 
-	// 3) Service + Handler
 	svc := service.NewKMSService(st, masterKey)
-	h := handlers.NewHandler(svc)
-
-	// 4) Wire routes
-	mux := http.NewServeMux()
-	h.RegisterRoutes(mux)
-	return mux, svc
+	return handlers.NewHandler(svc)
 }
 
 func TestFullIntegrationFlow(t *testing.T) {
-	handler, svc := bootstrapIntegration(t)
+	handler := bootstrapIntegration(t)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 	client := server.Client()
 
-	const keyID = "alpha"
 	const plaintext = "hello, integration!"
 	b64pt := base64.StdEncoding.EncodeToString([]byte(plaintext))
 
 	// 1) Create key
 	t.Run("GenerateKey", func(t *testing.T) {
-		body, _ := json.Marshal(map[string]string{"key_id": keyID})
+		body, _ := json.Marshal(map[string]string{
+			"key_id":    keyID,
+			"purpose":   purpose,
+			"algorithm": algorithm,
+		})
 		res, err := client.Post(server.URL+"/v1/kms/keys", "application/json", bytes.NewReader(body))
 		if err != nil {
 			t.Fatalf("POST /v1/kms/keys: %v", err)
@@ -87,7 +91,7 @@ func TestFullIntegrationFlow(t *testing.T) {
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusCreated {
 			b, _ := io.ReadAll(res.Body)
-			t.Fatalf("expected 201 Created, got %d: %s", res.StatusCode, string(b))
+			t.Fatalf("expected 201 Created, got %d: %s", res.StatusCode, b)
 		}
 	})
 
@@ -96,17 +100,17 @@ func TestFullIntegrationFlow(t *testing.T) {
 	// 2) Encrypt under v1
 	t.Run("EncryptDataV1", func(t *testing.T) {
 		reqBody, _ := json.Marshal(map[string]string{
-			"key_id":    keyID,
-			"plaintext": b64pt,
+			"data": b64pt,
 		})
-		res, err := client.Post(server.URL+"/v1/kms/encrypt", "application/json", bytes.NewReader(reqBody))
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/encrypt", server.URL, keyID, purpose, algorithm)
+		res, err := client.Post(url, "application/json", bytes.NewReader(reqBody))
 		if err != nil {
-			t.Fatalf("POST /v1/kms/encrypt: %v", err)
+			t.Fatalf("POST encrypt: %v", err)
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(res.Body)
-			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, string(b))
+			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, b)
 		}
 		var resp struct {
 			Ciphertext string `json:"ciphertext"`
@@ -123,17 +127,17 @@ func TestFullIntegrationFlow(t *testing.T) {
 	// 3) Decrypt under v1
 	t.Run("DecryptDataV1", func(t *testing.T) {
 		reqBody, _ := json.Marshal(map[string]string{
-			"key_id":     keyID,
-			"ciphertext": v1Ciphertext,
+			"data": v1Ciphertext,
 		})
-		res, err := client.Post(server.URL+"/v1/kms/decrypt", "application/json", bytes.NewReader(reqBody))
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/decrypt", server.URL, keyID, purpose, algorithm)
+		res, err := client.Post(url, "application/json", bytes.NewReader(reqBody))
 		if err != nil {
-			t.Fatalf("POST /v1/kms/decrypt: %v", err)
+			t.Fatalf("POST decrypt: %v", err)
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(res.Body)
-			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, string(b))
+			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, b)
 		}
 		var resp struct {
 			Plaintext string `json:"plaintext"`
@@ -146,49 +150,55 @@ func TestFullIntegrationFlow(t *testing.T) {
 			t.Fatalf("plaintext not valid base64: %v", err)
 		}
 		if string(decoded) != plaintext {
-			t.Fatalf("decrypted %q; want %q", string(decoded), plaintext)
+			t.Fatalf("decrypted %q; want %q", decoded, plaintext)
 		}
 	})
 
 	// 4) GET wrapped key
 	t.Run("GetWrappedKey", func(t *testing.T) {
-		res, err := client.Get(server.URL + "/v1/kms/keys/" + keyID)
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s", server.URL, keyID, purpose, algorithm)
+		res, err := client.Get(url)
 		if err != nil {
-			t.Fatalf("GET /v1/kms/keys/%s: %v", keyID, err)
+			t.Fatalf("GET wrapped key: %v", err)
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(res.Body)
-			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, string(b))
+			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, b)
 		}
 		var resp struct {
-			WrappedKeys []string `json:"wrapped_keys"`
+			KeyVersions []struct {
+				Version int    `json:"version"`
+				Wrapped string `json:"wrapped"`
+			} `json:"key_versions"`
 		}
 		if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
 			t.Fatalf("decode get response: %v", err)
 		}
-		if len(resp.WrappedKeys) != 1 {
-			t.Fatalf("expected 1 wrapped key, got %d", len(resp.WrappedKeys))
+		if len(resp.KeyVersions) != 1 {
+			t.Fatalf("expected 1 wrapped key, got %d", len(resp.KeyVersions))
 		}
 	})
 
 	// 5) DELETE key
 	t.Run("DeleteKey", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodDelete, server.URL+"/v1/kms/keys/"+keyID, nil)
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s", server.URL, keyID, purpose, algorithm)
+		req, _ := http.NewRequest(http.MethodDelete, url, nil)
 		res, err := client.Do(req)
 		if err != nil {
-			t.Fatalf("DELETE /v1/kms/keys/%s: %v", keyID, err)
+			t.Fatalf("DELETE key: %v", err)
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusNoContent {
 			b, _ := io.ReadAll(res.Body)
-			t.Fatalf("expected 204 No Content, got %d: %s", res.StatusCode, string(b))
+			t.Fatalf("expected 204 No Content, got %d: %s", res.StatusCode, b)
 		}
 	})
 
 	// 6) GET after delete => 404
 	t.Run("GetAfterDelete", func(t *testing.T) {
-		res, err := client.Get(server.URL + "/v1/kms/keys/" + keyID)
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s", server.URL, keyID, purpose, algorithm)
+		res, err := client.Get(url)
 		if err != nil {
 			t.Fatalf("GET after delete: %v", err)
 		}
@@ -200,72 +210,82 @@ func TestFullIntegrationFlow(t *testing.T) {
 
 	// 7a) RECREATE key which does not exist
 	t.Run("RecreateMissingKey", func(t *testing.T) {
-		res, err := client.Post(server.URL+"/v1/kms/keys/"+keyID+"/recreate", "application/json", nil)
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/recreate", server.URL, keyID, purpose, algorithm)
+		res, err := client.Post(url, "application/json", nil)
 		if err != nil {
-			t.Fatalf("POST /v1/kms/keys/%s/recreate: %v", keyID, err)
+			t.Fatalf("POST recreate missing: %v", err)
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusNotFound {
 			b, _ := io.ReadAll(res.Body)
-			t.Fatalf("expected 404 Not Found, got %d: %s", res.StatusCode, string(b))
+			t.Fatalf("expected 404 Not Found, got %d: %s", res.StatusCode, b)
 		}
 	})
 
 	// 7b) RECREATE key which exists
 	t.Run("RecreateExistingKey", func(t *testing.T) {
-		body, _ := json.Marshal(map[string]string{"key_id": keyID})
+		body, _ := json.Marshal(map[string]string{
+			"key_id":    keyID,
+			"purpose":   purpose,
+			"algorithm": algorithm,
+		})
 		_, err := client.Post(server.URL+"/v1/kms/keys", "application/json", bytes.NewReader(body))
 		if err != nil {
-			t.Fatalf("POST /v1/kms/keys: %v", err)
+			t.Fatalf("POST create for recreate: %v", err)
 		}
 
-		resRECREATE, errRECREATE := client.Post(server.URL+"/v1/kms/keys/"+keyID+"/recreate", "application/json", nil)
-		if errRECREATE != nil {
-			t.Fatalf("POST /v1/kms/keys/%s/recreate: %v", keyID, err)
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/recreate", server.URL, keyID, purpose, algorithm)
+		res, err := client.Post(url, "application/json", nil)
+		if err != nil {
+			t.Fatalf("POST recreate existing: %v", err)
 		}
-		defer resRECREATE.Body.Close()
-		if resRECREATE.StatusCode != http.StatusCreated {
-			b, _ := io.ReadAll(resRECREATE.Body)
-			t.Fatalf("expected 201 Created, got %d: %s", resRECREATE.StatusCode, string(b))
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusCreated {
+			b, _ := io.ReadAll(res.Body)
+			t.Fatalf("expected 201 Created, got %d: %s", res.StatusCode, b)
 		}
 	})
 
 	// 8) GET after recreate => 200 + one wrapped key
 	t.Run("GetAfterRecreate", func(t *testing.T) {
-		res, err := client.Get(server.URL + "/v1/kms/keys/" + keyID)
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s", server.URL, keyID, purpose, algorithm)
+		res, err := client.Get(url)
 		if err != nil {
 			t.Fatalf("GET after recreate: %v", err)
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(res.Body)
-			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, string(b))
+			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, b)
 		}
 		var resp struct {
-			WrappedKeys []string `json:"wrapped_keys"`
+			KeyVersions []struct {
+				Version int    `json:"version"`
+				Wrapped string `json:"wrapped"`
+			} `json:"key_versions"`
 		}
 		if err := json.NewDecoder(res.Body).Decode(&resp); err != nil {
 			t.Fatalf("decode get after recreate: %v", err)
 		}
-		if len(resp.WrappedKeys) != 1 {
-			t.Fatalf("expected 1 wrapped key after recreate, got %d", len(resp.WrappedKeys))
+		if len(resp.KeyVersions) != 1 {
+			t.Fatalf("expected 1 wrapped key after recreate, got %d", len(resp.KeyVersions))
 		}
 	})
 
 	// 9a) Encrypt under v1 of the RECREATED key
 	t.Run("EncryptDataWithRecreatedV1", func(t *testing.T) {
 		reqBody, _ := json.Marshal(map[string]string{
-			"key_id":    keyID,
-			"plaintext": b64pt,
+			"data": b64pt,
 		})
-		res, err := client.Post(server.URL+"/v1/kms/encrypt", "application/json", bytes.NewReader(reqBody))
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/encrypt", server.URL, keyID, purpose, algorithm)
+		res, err := client.Post(url, "application/json", bytes.NewReader(reqBody))
 		if err != nil {
-			t.Fatalf("POST /v1/kms/encrypt: %v", err)
+			t.Fatalf("POST encrypt v1 recreated: %v", err)
 		}
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(res.Body)
-			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, string(b))
+			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, b)
 		}
 		var resp struct {
 			Ciphertext string `json:"ciphertext"`
@@ -279,26 +299,31 @@ func TestFullIntegrationFlow(t *testing.T) {
 		v1Ciphertext = resp.Ciphertext
 	})
 
-	// 9b) Rotate to v2, ensure old-v1 ciphertext still decrypts and new encrypt/decrypt works
+	// 9b) Rotate to v2, then decrypt v1 and encrypt/decrypt under v2
 	t.Run("RotateAndEncrypt", func(t *testing.T) {
-		// Rotate the DEK to version 2
-		if err := svc.RotateKey(keyID); err != nil {
-			t.Fatalf("RotateKey: %v", err)
+		// rotate
+		url := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/rotate", server.URL, keyID, purpose, algorithm)
+		res, err := client.Post(url, "application/json", nil)
+		if err != nil {
+			t.Fatalf("POST rotate: %v", err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(res.Body)
+			t.Fatalf("expected 200 OK, got %d: %s", res.StatusCode, b)
 		}
 
-		// 9a) Decrypt the original v1 ciphertext
-		oldReq, _ := json.Marshal(map[string]string{
-			"key_id":     keyID,
-			"ciphertext": v1Ciphertext,
-		})
-		oldRes, err := client.Post(server.URL+"/v1/kms/decrypt", "application/json", bytes.NewReader(oldReq))
+		// decrypt original v1
+		oldReq, _ := json.Marshal(map[string]string{"data": v1Ciphertext})
+		oldURL := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/decrypt", server.URL, keyID, purpose, algorithm)
+		oldRes, err := client.Post(oldURL, "application/json", bytes.NewReader(oldReq))
 		if err != nil {
 			t.Fatalf("decrypt v1 after rotate: %v", err)
 		}
 		defer oldRes.Body.Close()
 		if oldRes.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(oldRes.Body)
-			t.Fatalf("expected 200 OK, got %d: %s", oldRes.StatusCode, string(b))
+			t.Fatalf("expected 200 OK, got %d: %s", oldRes.StatusCode, b)
 		}
 		var oldResp struct {
 			Plaintext string `json:"plaintext"`
@@ -306,30 +331,24 @@ func TestFullIntegrationFlow(t *testing.T) {
 		if err := json.NewDecoder(oldRes.Body).Decode(&oldResp); err != nil {
 			t.Fatalf("decode old decrypt response: %v", err)
 		}
-		decodedOld, err := base64.StdEncoding.DecodeString(oldResp.Plaintext)
-		if err != nil {
-			t.Fatalf("old plaintext not valid base64: %v", err)
-		}
+		decodedOld, _ := base64.StdEncoding.DecodeString(oldResp.Plaintext)
 		if string(decodedOld) != plaintext {
-			t.Fatalf("v1 ciphertext decrypted to %q; want %q", string(decodedOld), plaintext)
+			t.Fatalf("v1 decrypted to %q; want %q", decodedOld, plaintext)
 		}
 
-		// 9b) Encrypt & decrypt a new message under v2
+		// encrypt under v2
 		newPlain := "still works under v2"
 		b64New := base64.StdEncoding.EncodeToString([]byte(newPlain))
-
-		encReq, _ := json.Marshal(map[string]string{
-			"key_id":    keyID,
-			"plaintext": b64New,
-		})
-		encRes, err := client.Post(server.URL+"/v1/kms/encrypt", "application/json", bytes.NewReader(encReq))
+		encReqBody, _ := json.Marshal(map[string]string{"data": b64New})
+		encURL := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/encrypt", server.URL, keyID, purpose, algorithm)
+		encRes, err := client.Post(encURL, "application/json", bytes.NewReader(encReqBody))
 		if err != nil {
 			t.Fatalf("encrypt under v2: %v", err)
 		}
 		defer encRes.Body.Close()
 		if encRes.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(encRes.Body)
-			t.Fatalf("expected 200 OK on v2 encrypt, got %d: %s", encRes.StatusCode, string(b))
+			t.Fatalf("expected 200 OK on v2 encrypt, got %d: %s", encRes.StatusCode, b)
 		}
 		var encResp struct {
 			Ciphertext string `json:"ciphertext"`
@@ -338,18 +357,17 @@ func TestFullIntegrationFlow(t *testing.T) {
 			t.Fatalf("decode v2 encrypt response: %v", err)
 		}
 
-		decReq, _ := json.Marshal(map[string]string{
-			"key_id":     keyID,
-			"ciphertext": encResp.Ciphertext,
-		})
-		decRes, err := client.Post(server.URL+"/v1/kms/decrypt", "application/json", bytes.NewReader(decReq))
+		// decrypt under v2
+		decReqBody, _ := json.Marshal(map[string]string{"data": encResp.Ciphertext})
+		decURL := fmt.Sprintf("%s/v1/kms/keys/%s/%s/%s/decrypt", server.URL, keyID, purpose, algorithm)
+		decRes, err := client.Post(decURL, "application/json", bytes.NewReader(decReqBody))
 		if err != nil {
 			t.Fatalf("decrypt under v2: %v", err)
 		}
 		defer decRes.Body.Close()
 		if decRes.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(decRes.Body)
-			t.Fatalf("expected 200 OK on v2 decrypt, got %d: %s", decRes.StatusCode, string(b))
+			t.Fatalf("expected 200 OK on v2 decrypt, got %d: %s", decRes.StatusCode, b)
 		}
 		var decResp struct {
 			Plaintext string `json:"plaintext"`
@@ -357,12 +375,9 @@ func TestFullIntegrationFlow(t *testing.T) {
 		if err := json.NewDecoder(decRes.Body).Decode(&decResp); err != nil {
 			t.Fatalf("decode v2 decrypt response: %v", err)
 		}
-		decodedNew, err := base64.StdEncoding.DecodeString(decResp.Plaintext)
-		if err != nil {
-			t.Fatalf("new plaintext not valid base64: %v", err)
-		}
+		decodedNew, _ := base64.StdEncoding.DecodeString(decResp.Plaintext)
 		if string(decodedNew) != newPlain {
-			t.Fatalf("v2 ciphertext decrypted to %q; want %q", string(decodedNew), newPlain)
+			t.Fatalf("v2 decrypted to %q; want %q", decodedNew, newPlain)
 		}
 	})
 }
