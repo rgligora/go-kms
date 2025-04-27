@@ -1,3 +1,4 @@
+// internal/api/kms_handler_test.go
 package handlers
 
 import (
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rgligora/go-kms/internal/kmspec"
 	"github.com/rgligora/go-kms/internal/service"
 	"github.com/rgligora/go-kms/internal/store"
 )
@@ -25,19 +27,24 @@ func newMemStore() *memStore {
 	return &memStore{data: make(map[string][]store.KeyVersion)}
 }
 
-func (m *memStore) StoreWrappedKey(keyID string, version int, wrapped []byte) error {
+func specKey(spec kmspec.KeySpec) string {
+	return spec.KeyID + "|" + string(spec.Purpose) + "|" + string(spec.Algorithm)
+}
+
+func (m *memStore) StoreWrappedKey(spec kmspec.KeySpec, version int, wrapped []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	key := specKey(spec)
 	wcopy := append([]byte(nil), wrapped...)
 	kv := store.KeyVersion{Version: version, Wrapped: wcopy, CreatedAt: time.Now()}
-	m.data[keyID] = append(m.data[keyID], kv)
+	m.data[key] = append(m.data[key], kv)
 	return nil
 }
 
-func (m *memStore) LoadWrappedKey(keyID string) ([]store.KeyVersion, error) {
+func (m *memStore) LoadWrappedKey(spec kmspec.KeySpec) ([]store.KeyVersion, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	kvs, ok := m.data[keyID]
+	kvs, ok := m.data[specKey(spec)]
 	if !ok {
 		return nil, store.ErrNotFound
 	}
@@ -49,10 +56,10 @@ func (m *memStore) LoadWrappedKey(keyID string) ([]store.KeyVersion, error) {
 	return out, nil
 }
 
-func (m *memStore) LoadLatestWrappedKey(keyID string) ([]byte, int, error) {
+func (m *memStore) LoadLatestWrappedKey(spec kmspec.KeySpec) ([]byte, int, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	kvs, ok := m.data[keyID]
+	kvs, ok := m.data[specKey(spec)]
 	if !ok || len(kvs) == 0 {
 		return nil, 0, store.ErrNotFound
 	}
@@ -60,10 +67,10 @@ func (m *memStore) LoadLatestWrappedKey(keyID string) ([]byte, int, error) {
 	return append([]byte(nil), latest.Wrapped...), latest.Version, nil
 }
 
-func (m *memStore) LoadWrappedKeyVersion(keyID string, version int) ([]byte, error) {
+func (m *memStore) LoadWrappedKeyVersion(spec kmspec.KeySpec, version int) ([]byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, kv := range m.data[keyID] {
+	for _, kv := range m.data[specKey(spec)] {
 		if kv.Version == version {
 			return append([]byte(nil), kv.Wrapped...), nil
 		}
@@ -71,31 +78,37 @@ func (m *memStore) LoadWrappedKeyVersion(keyID string, version int) ([]byte, err
 	return nil, store.ErrNotFound
 }
 
-func (m *memStore) DeleteWrappedKey(keyID string) error {
+func (m *memStore) DeleteWrappedKey(spec kmspec.KeySpec) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.data[keyID]; !ok {
+	key := specKey(spec)
+	if _, ok := m.data[key]; !ok {
 		return store.ErrNotFound
 	}
-	delete(m.data, keyID)
+	delete(m.data, key)
 	return nil
 }
 
-func (m *memStore) ListKeyIDs() ([]string, error) {
+func (m *memStore) ListKeySpecs() ([]kmspec.KeySpec, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	ids := make([]string, 0, len(m.data))
-	for id := range m.data {
-		ids = append(ids, id)
+	var specs []kmspec.KeySpec
+	for key := range m.data {
+		parts := strings.SplitN(key, "|", 3)
+		specs = append(specs, kmspec.KeySpec{
+			KeyID:     parts[0],
+			Purpose:   kmspec.KeyPurpose(parts[1]),
+			Algorithm: kmspec.KeyAlgorithm(parts[2]),
+		})
 	}
-	return ids, nil
+	return specs, nil
 }
 
 // --- test setup ------------------------------------------------------------
 
-func setupHandler() *Handler {
+func setupHandler() http.Handler {
 	ms := newMemStore()
-	masterKey := []byte("0123456789abcdef0123456789abcdef") // 32-byte
+	masterKey := []byte("0123456789abcdef0123456789abcdef")
 	svc := service.NewKMSService(ms, masterKey)
 	return NewHandler(svc)
 }
@@ -103,9 +116,7 @@ func setupHandler() *Handler {
 // --- tests for POST /v1/kms/keys -------------------------------------------
 
 func TestHandleKeys(t *testing.T) {
-	h := setupHandler()
-	mux := http.NewServeMux()
-	h.RegisterRoutes(mux)
+	handler := setupHandler()
 
 	cases := []struct {
 		name       string
@@ -119,9 +130,13 @@ func TestHandleKeys(t *testing.T) {
 			name:       "Create key success",
 			method:     http.MethodPost,
 			url:        "/v1/kms/keys",
-			body:       `{"key_id":"foo"}`,
+			body:       `{"key_id":"foo","purpose":"encrypt","algorithm":"AES-256-GCM"}`,
 			wantStatus: http.StatusCreated,
-			wantResp:   map[string]string{"key_id": "foo"},
+			wantResp: map[string]string{
+				"key_id":    "foo",
+				"purpose":   "encrypt",
+				"algorithm": "AES-256-GCM",
+			},
 		},
 		{
 			name:       "Invalid method",
@@ -135,9 +150,25 @@ func TestHandleKeys(t *testing.T) {
 			name:       "Missing key_id",
 			method:     http.MethodPost,
 			url:        "/v1/kms/keys",
-			body:       `{}`,
+			body:       `{"purpose":"encrypt","algorithm":"AES-256-GCM"}`,
 			wantStatus: http.StatusBadRequest,
-			wantResp:   map[string]string{"error": "key_id is required"},
+			wantResp:   map[string]string{"error": "key_id, purpose, and algorithm are required"},
+		},
+		{
+			name:       "Missing purpose",
+			method:     http.MethodPost,
+			url:        "/v1/kms/keys",
+			body:       `{"key_id":"foo","algorithm":"AES-256-GCM"}`,
+			wantStatus: http.StatusBadRequest,
+			wantResp:   map[string]string{"error": "key_id, purpose, and algorithm are required"},
+		},
+		{
+			name:       "Missing algorithm",
+			method:     http.MethodPost,
+			url:        "/v1/kms/keys",
+			body:       `{"key_id":"foo","purpose":"encrypt"}`,
+			wantStatus: http.StatusBadRequest,
+			wantResp:   map[string]string{"error": "key_id, purpose, and algorithm are required"},
 		},
 		{
 			name:       "Invalid JSON",
@@ -150,7 +181,6 @@ func TestHandleKeys(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc // capture
 		t.Run(tc.name, func(t *testing.T) {
 			var buf *bytes.Buffer
 			if tc.body != "" {
@@ -159,8 +189,9 @@ func TestHandleKeys(t *testing.T) {
 				buf = &bytes.Buffer{}
 			}
 			req := httptest.NewRequest(tc.method, tc.url, buf)
+			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, req)
+			handler.ServeHTTP(w, req)
 
 			if w.Code != tc.wantStatus {
 				t.Fatalf("%s: expected status %d, got %d", tc.name, tc.wantStatus, w.Code)
@@ -170,7 +201,7 @@ func TestHandleKeys(t *testing.T) {
 				t.Fatalf("%s: decode error: %v", tc.name, err)
 			}
 			for k, v := range tc.wantResp {
-				if got, ok := resp[k]; !ok || got != v {
+				if got := resp[k]; got != v {
 					t.Errorf("%s: want resp[%q]=%q, got %q", tc.name, k, v, got)
 				}
 			}
@@ -178,97 +209,95 @@ func TestHandleKeys(t *testing.T) {
 	}
 }
 
-// --- tests for GET/DELETE/POST(rotate)/POST(recreate) /v1/kms/keys/{keyID} -------------
+// --- tests for key lifecycle under /v1/kms/keys/{keyID}/{purpose}/{algorithm} ---
 
-func TestHandleKeyByID(t *testing.T) {
-	h := setupHandler()
-	mux := http.NewServeMux()
-	h.RegisterRoutes(mux)
+func TestHandleKeyBySpec(t *testing.T) {
+	handler := setupHandler()
 
-	// pre-create "foo"
+	// pre-create "foo|encrypt|AES-256-GCM"
 	{
-		req := httptest.NewRequest(http.MethodPost, "/v1/kms/keys", bytes.NewBufferString(`{"key_id":"foo"}`))
+		body := `{"key_id":"foo","purpose":"encrypt","algorithm":"AES-256-GCM"}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/kms/keys", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
+		handler.ServeHTTP(w, req)
 		if w.Code != http.StatusCreated {
 			t.Fatalf("setup: create foo expected 201, got %d", w.Code)
 		}
 	}
 
+	base := "/v1/kms/keys/foo/encrypt/AES-256-GCM"
 	cases := []struct {
 		name         string
 		method, url  string
 		wantStatus   int
-		wantContains string // substring that must appear in the body
+		wantContains string
 	}{
 		{
 			name:         "Get existing key",
 			method:       http.MethodGet,
-			url:          "/v1/kms/keys/foo",
+			url:          base,
 			wantStatus:   http.StatusOK,
-			wantContains: `"wrapped_keys"`,
+			wantContains: `"key_versions"`,
 		},
 		{
 			name:         "Get missing key",
 			method:       http.MethodGet,
-			url:          "/v1/kms/keys/bar",
+			url:          "/v1/kms/keys/bar/encrypt/AES-256-GCM",
 			wantStatus:   http.StatusNotFound,
 			wantContains: `"error"`,
 		},
 		{
 			name:       "Rotate existing key",
 			method:     http.MethodPost,
-			url:        "/v1/kms/keys/foo/rotate",
+			url:        base + "/rotate",
 			wantStatus: http.StatusOK,
 		},
 		{
 			name:       "Rotate missing key",
 			method:     http.MethodPost,
-			url:        "/v1/kms/keys/baz/rotate",
+			url:        "/v1/kms/keys/baz/encrypt/AES-256-GCM/rotate",
 			wantStatus: http.StatusNotFound,
 		},
 		{
 			name:       "Recreate existing key",
 			method:     http.MethodPost,
-			url:        "/v1/kms/keys/foo/recreate",
+			url:        base + "/recreate",
 			wantStatus: http.StatusCreated,
 		},
 		{
 			name:       "Recreate missing key",
 			method:     http.MethodPost,
-			url:        "/v1/kms/keys/baz/recreate",
+			url:        "/v1/kms/keys/baz/encrypt/AES-256-GCM/recreate",
 			wantStatus: http.StatusNotFound,
 		},
 		{
 			name:       "Delete existing key",
 			method:     http.MethodDelete,
-			url:        "/v1/kms/keys/foo",
+			url:        base,
 			wantStatus: http.StatusNoContent,
 		},
 		{
 			name:         "Delete missing key",
 			method:       http.MethodDelete,
-			url:          "/v1/kms/keys/bar",
+			url:          "/v1/kms/keys/bar/encrypt/AES-256-GCM",
 			wantStatus:   http.StatusNotFound,
 			wantContains: `"error"`,
 		},
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.url, nil)
 			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, req)
+			handler.ServeHTTP(w, req)
 
 			if w.Code != tc.wantStatus {
 				t.Errorf("%s: expected status %d, got %d", tc.name, tc.wantStatus, w.Code)
 			}
-			if tc.wantContains != "" {
-				if !strings.Contains(w.Body.String(), tc.wantContains) {
-					t.Errorf("%s: expected body to contain %q, got %q",
-						tc.name, tc.wantContains, w.Body.String())
-				}
+			if tc.wantContains != "" && !strings.Contains(w.Body.String(), tc.wantContains) {
+				t.Errorf("%s: expected body to contain %q, got %q",
+					tc.name, tc.wantContains, w.Body.String())
 			}
 		})
 	}

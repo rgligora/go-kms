@@ -1,251 +1,295 @@
+// internal/api/kms_handlers.go
 package handlers
 
 import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"github.com/rgligora/go-kms/internal/store"
-	"log"
+	"fmt"
 	"net/http"
-	"strings"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/rgligora/go-kms/internal/kmspec"
 	"github.com/rgligora/go-kms/internal/service"
+	"github.com/rgligora/go-kms/internal/store"
 )
 
-// Handler wraps KMSService for HTTP handlers.
+// Handler holds your KMS service.
 type Handler struct {
-	Service *service.KMSService
+	Svc *service.KMSService
 }
 
-// NewHandler constructs a new HTTP handler.
-func NewHandler(svc *service.KMSService) *Handler {
-	return &Handler{Service: svc}
+// NewHandler wires up all routes and installs a JSON MethodNotAllowed.
+func NewHandler(svc *service.KMSService) http.Handler {
+	h := &Handler{Svc: svc}
+	r := chi.NewRouter()
+
+	// Return JSON error on unsupported methods
+	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+	})
+
+	// Key lifecycle
+	r.Post("/v1/kms/keys", h.createKey)
+	r.Route("/v1/kms/keys/{keyID}/{purpose}/{algorithm}", func(r chi.Router) {
+		r.Get("/", h.getKey)
+		r.Delete("/", h.deleteKey)
+		r.Post("/rotate", h.rotateKey)
+		r.Post("/recreate", h.recreateKey)
+	})
+
+	// Data operations
+	r.Post("/v1/kms/keys/{keyID}/{purpose}/{algorithm}/encrypt", h.encryptData)
+	r.Post("/v1/kms/keys/{keyID}/{purpose}/{algorithm}/decrypt", h.decryptData)
+	r.Post("/v1/kms/keys/{keyID}/{purpose}/{algorithm}/sign", h.signData)
+	r.Post("/v1/kms/keys/{keyID}/{purpose}/{algorithm}/verify", h.verifyData)
+
+	return r
 }
 
-// RegisterRoutes registers KMS endpoints on the given ServeMux.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/kms/keys", h.handleKeys)
-	mux.HandleFunc("/v1/kms/keys/", h.handleKeyByID)
-	mux.HandleFunc("/v1/kms/encrypt", h.handleEncrypt)
-	mux.HandleFunc("/v1/kms/decrypt", h.handleDecrypt)
+// ─── Helpers ────────────────────────────────────────────────────────────
+
+// extractSpec builds a KeySpec from URL path parameters.
+func extractSpec(r *http.Request) (kmspec.KeySpec, error) {
+	keyID := chi.URLParam(r, "keyID")
+	purp := chi.URLParam(r, "purpose")
+	alg := chi.URLParam(r, "algorithm")
+	if keyID == "" || purp == "" || alg == "" {
+		return kmspec.KeySpec{}, errors.New("missing path parameters")
+	}
+	return kmspec.KeySpec{
+		KeyID:     keyID,
+		Purpose:   kmspec.KeyPurpose(purp),
+		Algorithm: kmspec.KeyAlgorithm(alg),
+	}, nil
 }
 
-// JSONError writes an error response with given status code.
-func JSONError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
-}
-
-func logRequest(r *http.Request, msg string) {
-	log.Printf("%s %s → %s", r.Method, r.URL.Path, msg)
-}
-
-// handleKeys handles POST /v1/kms/keys for key creation.
-func (h *Handler) handleKeys(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		JSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
+// decodeBody decodes {"data":"BASE64…"} into a *[]byte.
+func decodeBody(r *http.Request, dst interface{}) error {
+	wrapper := struct{ Data string }{}
+	if err := json.NewDecoder(r.Body).Decode(&wrapper); err != nil {
+		return err
 	}
-
-	// Parse request body
-	var req struct {
-		KeyID string `json:"key_id"`
+	raw, err := base64.StdEncoding.DecodeString(wrapper.Data)
+	if err != nil {
+		return fmt.Errorf("invalid base64: %w", err)
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		JSONError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	if req.KeyID == "" {
-		JSONError(w, http.StatusBadRequest, "key_id is required")
-		return
-	}
-
-	// Generate the key
-	if err := h.Service.CreateKey(req.KeyID); err != nil {
-		JSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	logRequest(r, "created key: "+req.KeyID)
-
-	// Respond
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"key_id": req.KeyID})
-}
-
-// handleKeyByID handles:
-//
-//	GET    /v1/kms/keys/{keyID}
-//	DELETE /v1/kms/keys/{keyID}
-//	POST   /v1/kms/keys/{keyID}/rotate
-//	POST   /v1/kms/keys/{keyID}/recreate
-func (h *Handler) handleKeyByID(w http.ResponseWriter, r *http.Request) {
-	// Strip prefix + split
-	p := strings.TrimPrefix(r.URL.Path, "/v1/kms/keys/")
-	parts := strings.Split(p, "/")
-	keyID := parts[0]
-	if keyID == "" {
-		JSONError(w, http.StatusBadRequest, "key_id is required in path")
-		return
-	}
-
-	// Decide which op
-	switch {
-	// ── GET wrapped key ───────────────────────────────────────────
-	case len(parts) == 1 && r.Method == http.MethodGet:
-		kvs, err := h.Service.GetWrappedKey(keyID)
-		if err != nil {
-			JSONError(w, http.StatusNotFound, err.Error())
-			return
-		}
-		// build a response struct that includes version + wrapped blob
-		type versionResp struct {
-			Version int    `json:"version"`
-			Wrapped string `json:"wrapped"` // base64
-		}
-		out := make([]versionResp, 0, len(kvs))
-		for _, kv := range kvs {
-			out = append(out, versionResp{
-				Version: kv.Version,
-				Wrapped: base64.StdEncoding.EncodeToString(kv.Wrapped),
-			})
-		}
-		logRequest(r, "retrieved wrapped key versions: "+keyID)
-		w.Header().Set("Content-Type", "application/json")
-		// payload: { "key_versions": [ { "version":1, "wrapped":"..." }, ... ] }
-		json.NewEncoder(w).Encode(map[string]interface{}{"key_versions": out})
-		return
-
-	// ── DELETE key ─────────────────────────────────────────────────
-	case len(parts) == 1 && r.Method == http.MethodDelete:
-		if err := h.Service.DeleteKey(keyID); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				JSONError(w, http.StatusNotFound, err.Error())
-			} else {
-				JSONError(w, http.StatusInternalServerError, err.Error())
-			}
-			return
-		}
-		logRequest(r, "deleted key: "+keyID)
-		w.WriteHeader(http.StatusNoContent)
-		return
-
-	// ── POST /rotate ─────────────────────────────────────────────
-	case len(parts) == 2 && parts[1] == "rotate" && r.Method == http.MethodPost:
-		err := h.Service.RotateKey(keyID)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				logRequest(r, "rotate missing key: "+keyID)
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			JSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		logRequest(r, "rotated key: "+keyID)
-		w.WriteHeader(http.StatusOK)
-		return
-
-	// ── POST /recreate ─────────────────────────────────────────────
-	case len(parts) == 2 && parts[1] == "recreate" && r.Method == http.MethodPost:
-		err := h.Service.RecreateKey(keyID)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				logRequest(r, "recreate missing key: "+keyID)
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			JSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		logRequest(r, "recreated key: "+keyID)
-		w.WriteHeader(http.StatusCreated)
-		return
-
+	switch ptr := dst.(type) {
+	case *[]byte:
+		*ptr = raw
+		return nil
 	default:
-		JSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
+		return fmt.Errorf("unsupported dst type %T", dst)
 	}
 }
 
-// handleEncrypt handles POST /v1/kms/encrypt
-func (h *Handler) handleEncrypt(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		JSONError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	// Parse request
+// writeJSON writes v as JSON with the given status code.
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+// ─── Handlers ────────────────────────────────────────────────────────────
+
+func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		KeyID     string `json:"key_id"`
-		Plaintext string `json:"plaintext"` // base64-encoded
+		Purpose   string `json:"purpose"`
+		Algorithm string `json:"algorithm"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		JSONError(w, http.StatusBadRequest, "invalid JSON")
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	if req.KeyID == "" || req.Plaintext == "" {
-		JSONError(w, http.StatusBadRequest, "key_id and plaintext are required")
+	// Validate required fields
+	if req.KeyID == "" || req.Purpose == "" || req.Algorithm == "" {
+		writeJSON(w, http.StatusBadRequest,
+			map[string]string{"error": "key_id, purpose, and algorithm are required"})
 		return
 	}
-	// Decode base64 plaintext
-	pt, err := base64.StdEncoding.DecodeString(req.Plaintext)
-	if err != nil {
-		JSONError(w, http.StatusBadRequest, "plaintext not valid base64")
-		return
-	}
-	// Encrypt
-	ct, err := h.Service.EncryptData(req.KeyID, pt)
-	if err != nil {
-		JSONError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	// Encode ciphertext
-	enc := base64.StdEncoding.EncodeToString(ct)
 
-	logRequest(r, "encrypted data using key: "+req.KeyID)
+	spec := kmspec.KeySpec{
+		KeyID:     req.KeyID,
+		Purpose:   kmspec.KeyPurpose(req.Purpose),
+		Algorithm: kmspec.KeyAlgorithm(req.Algorithm),
+	}
+	if err := h.Svc.CreateKey(spec); err != nil {
+		if errors.Is(err, service.ErrKeyAlreadyExists) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return
+	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"ciphertext": enc})
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"key_id":    spec.KeyID,
+		"purpose":   string(spec.Purpose),
+		"algorithm": string(spec.Algorithm),
+	})
 }
 
-// handleDecrypt handles POST /v1/kms/decrypt
-func (h *Handler) handleDecrypt(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		JSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+func (h *Handler) getKey(w http.ResponseWriter, r *http.Request) {
+	spec, err := extractSpec(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	// Parse request
+	kvs, err := h.Svc.GetWrappedKey(spec)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	out := make([]map[string]interface{}, len(kvs))
+	for i, kv := range kvs {
+		out[i] = map[string]interface{}{
+			"version": kv.Version,
+			"wrapped": base64.StdEncoding.EncodeToString(kv.Wrapped),
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"key_versions": out})
+}
+
+func (h *Handler) deleteKey(w http.ResponseWriter, r *http.Request) {
+	spec, err := extractSpec(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.Svc.DeleteKey(spec); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) rotateKey(w http.ResponseWriter, r *http.Request) {
+	spec, err := extractSpec(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.Svc.RotateKey(spec); err != nil {
+		if errors.Is(err, service.ErrKeyNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) recreateKey(w http.ResponseWriter, r *http.Request) {
+	spec, err := extractSpec(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := h.Svc.RecreateKey(spec); err != nil {
+		if errors.Is(err, service.ErrKeyNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (h *Handler) encryptData(w http.ResponseWriter, r *http.Request) {
+	spec, err := extractSpec(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	var plaintext []byte
+	if err := decodeBody(r, &plaintext); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	ct, err := h.Svc.EncryptData(spec, plaintext)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"ciphertext": base64.StdEncoding.EncodeToString(ct)})
+}
+
+func (h *Handler) decryptData(w http.ResponseWriter, r *http.Request) {
+	spec, err := extractSpec(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	var ciphertext []byte
+	if err := decodeBody(r, &ciphertext); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	pt, err := h.Svc.DecryptDataWithSpec(spec, ciphertext)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"plaintext": base64.StdEncoding.EncodeToString(pt)})
+}
+
+func (h *Handler) signData(w http.ResponseWriter, r *http.Request) {
+	spec, err := extractSpec(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	var message []byte
+	if err := decodeBody(r, &message); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	sig, err := h.Svc.SignData(spec, message)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"signature": base64.StdEncoding.EncodeToString(sig)})
+}
+
+func (h *Handler) verifyData(w http.ResponseWriter, r *http.Request) {
+	spec, err := extractSpec(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	var req struct {
-		KeyID      string `json:"key_id"`
-		Ciphertext string `json:"ciphertext"` // base64-encoded
+		Message   string `json:"message"`
+		Signature string `json:"signature"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		JSONError(w, http.StatusBadRequest, "invalid JSON")
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	if req.KeyID == "" || req.Ciphertext == "" {
-		JSONError(w, http.StatusBadRequest, "key_id and ciphertext are required")
-		return
-	}
-	// Decode base64 ciphertext
-	ct, err := base64.StdEncoding.DecodeString(req.Ciphertext)
+	msg, err := base64.StdEncoding.DecodeString(req.Message)
 	if err != nil {
-		JSONError(w, http.StatusBadRequest, "ciphertext not valid base64")
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "message not valid base64"})
 		return
 	}
-	// Decrypt
-	pt, err := h.Service.DecryptData(req.KeyID, ct)
+	sig, err := base64.StdEncoding.DecodeString(req.Signature)
 	if err != nil {
-		JSONError(w, http.StatusInternalServerError, err.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "signature not valid base64"})
 		return
 	}
-	// Encode plaintext
-	enc := base64.StdEncoding.EncodeToString(pt)
-
-	logRequest(r, "decrypted data using key: "+req.KeyID)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"plaintext": enc})
+	if err := h.Svc.VerifySignature(spec, msg, sig); err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"valid": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"valid": true})
 }
