@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"database/sql"
+	"github.com/rgligora/go-kms/internal/kmspec"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -26,14 +27,17 @@ func setupStore(t *testing.T) *SQLiteStore {
 	if _, err := db.Exec(`
       CREATE TABLE keys (
         key_id      TEXT    NOT NULL,
+        purpose     TEXT    NOT NULL,
+        algorithm   TEXT    NOT NULL,
         version     INTEGER NOT NULL,
         wrapped_key BLOB    NOT NULL,
         created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (key_id, version)
+        PRIMARY KEY (key_id, purpose, algorithm, version)
       );
     `); err != nil {
 		t.Fatal(err)
 	}
+
 	return NewSQLiteStore(db)
 }
 
@@ -54,11 +58,18 @@ func TestSaltRoundTrip(t *testing.T) {
 
 func TestStoreAndLoadAllVersions(t *testing.T) {
 	s := setupStore(t)
-	// write two versions
-	s.StoreWrappedKey("foo", 1, []byte("v1"))
-	s.StoreWrappedKey("foo", 2, []byte("v2"))
 
-	kvs, err := s.LoadWrappedKey("foo")
+	spec := kmspec.KeySpec{
+		KeyID:     "foo",
+		Purpose:   kmspec.PurposeEncrypt,
+		Algorithm: kmspec.AlgAES256GCM,
+	}
+
+	// write two versions
+	s.StoreWrappedKey(spec, 1, []byte("v1"))
+	s.StoreWrappedKey(spec, 2, []byte("v2"))
+
+	kvs, err := s.LoadWrappedKey(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
