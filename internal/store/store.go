@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"github.com/rgligora/go-kms/internal/kmspec"
 	"time"
 )
 
@@ -26,18 +27,18 @@ type MetadataStore interface {
 
 // SecretStore defines operations for storing wrapped DEKs and other secrets.
 type SecretStore interface {
-	// StoreWrappedKey saves or updates a wrapped data-encryption key (DEK) by ID.
-	StoreWrappedKey(keyID string, version int, wrapped []byte) error
-	// LoadWrappedKey retrieves the wrapped DEK for the given ID.
-	LoadWrappedKey(keyID string) (key []KeyVersion, err error)
-	// LoadLatestWrappedKey retrieves the latest wrapped DEK for the given ID.
-	LoadLatestWrappedKey(keyID string) (wrapped []byte, version int, err error)
-	// LoadWrappedKeyVersion retrieves the specific version of the wrapped DEK
-	LoadWrappedKeyVersion(keyID string, version int) ([]byte, error)
-	// DeleteWrappedKey deletes the wrapped DEK associated with the given ID.
-	DeleteWrappedKey(keyID string) error
-	// ListKeyIDs returns all stored key IDs.
-	ListKeyIDs() ([]string, error)
+	// StoreWrappedKey saves or updates a wrapped key for the given spec & version.
+	StoreWrappedKey(spec kmspec.KeySpec, version int, wrapped []byte) error
+	// LoadWrappedKey loads *all* versions for the given spec.
+	LoadWrappedKey(spec kmspec.KeySpec) (key []KeyVersion, err error)
+	// LoadLatestWrappedKey loads the latest version for the given spec.
+	LoadLatestWrappedKey(spec kmspec.KeySpec) (wrapped []byte, version int, err error)
+	// LoadWrappedKeyVersion loads a specific version for the given spec.
+	LoadWrappedKeyVersion(spec kmspec.KeySpec, version int) ([]byte, error)
+	// DeleteWrappedKey deletes *all* versions for the given spec.
+	DeleteWrappedKey(spec kmspec.KeySpec) error
+	// ListKeySpecs returns all stored key specs.
+	ListKeySpecs() ([]kmspec.KeySpec, error)
 }
 
 // SQLiteStore implements MetadataStore and SecretStore using SQLite.
@@ -77,25 +78,25 @@ func (s *SQLiteStore) SetMasterKeySalt(salt []byte) error {
 	return err
 }
 
-// StoreWrappedKey saves or updates a wrapped DEK in the keys table.
-func (s *SQLiteStore) StoreWrappedKey(keyID string, version int, wrapped []byte) error {
+// StoreWrappedKey saves or updates a wrapped key in the keys table.
+func (s *SQLiteStore) StoreWrappedKey(spec kmspec.KeySpec, version int, wrapped []byte) error {
 	_, err := s.db.Exec(`
-      INSERT INTO keys (key_id, version, wrapped_key)
-           VALUES (?, ?, ?)
-      ON CONFLICT(key_id, version) DO UPDATE
+      INSERT INTO `+keysTable+` (key_id, purpose, algorithm, version, wrapped_key)
+           VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(key_id, purpose, algorithm, version) DO UPDATE
         SET wrapped_key = excluded.wrapped_key
-    `, keyID, version, wrapped)
+    `, spec.KeyID, spec.Purpose, spec.Algorithm, version, wrapped)
 	return err
 }
 
-// LoadWrappedKey loads *all* versions for a given key ID.
-func (s *SQLiteStore) LoadWrappedKey(keyID string) ([]KeyVersion, error) {
+// LoadWrappedKey loads *all* versions for a given KeySpec.
+func (s *SQLiteStore) LoadWrappedKey(spec kmspec.KeySpec) ([]KeyVersion, error) {
 	rows, err := s.db.Query(`
       SELECT version, wrapped_key, created_at
-        FROM keys
-       WHERE key_id = ?
+        FROM `+keysTable+`
+       WHERE key_id = ? AND purpose = ? AND algorithm = ?
     ORDER BY version
-    `, keyID)
+    `, spec.KeyID, spec.Purpose, spec.Algorithm)
 	if err != nil {
 		return nil, err
 	}
@@ -115,39 +116,43 @@ func (s *SQLiteStore) LoadWrappedKey(keyID string) ([]KeyVersion, error) {
 	return out, rows.Err()
 }
 
-func (s *SQLiteStore) LoadLatestWrappedKey(keyID string) ([]byte, int, error) {
+// LoadLatestWrappedKey retrieves the latest wrapped key for a given KeySpec
+func (s *SQLiteStore) LoadLatestWrappedKey(spec kmspec.KeySpec) ([]byte, int, error) {
 	var wrapped []byte
 	var version int
 	err := s.db.QueryRow(`
       SELECT wrapped_key, version
-        FROM keys
-       WHERE key_id = ?
+        FROM `+keysTable+`
+       WHERE key_id = ? AND purpose = ? AND algorithm = ?
     ORDER BY version DESC
        LIMIT 1
-    `, keyID).Scan(&wrapped, &version)
-	if err == sql.ErrNoRows {
+    `, spec.KeyID, spec.Purpose, spec.Algorithm).Scan(&wrapped, &version)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, 0, ErrNotFound
 	}
 	return wrapped, version, err
 }
 
-// LoadWrappedKeyVersion retrieves a specific version of the wrapped DEK.
-func (s *SQLiteStore) LoadWrappedKeyVersion(keyID string, version int) ([]byte, error) {
+// LoadWrappedKeyVersion retrieves a specific version for a given KeySpec.
+func (s *SQLiteStore) LoadWrappedKeyVersion(spec kmspec.KeySpec, version int) ([]byte, error) {
 	var wrapped []byte
 	err := s.db.QueryRow(`
       SELECT wrapped_key
-        FROM keys
-       WHERE key_id = ? AND version = ?
-    `, keyID, version).Scan(&wrapped)
-	if err == sql.ErrNoRows {
+        FROM `+keysTable+`
+       WHERE key_id = ? AND purpose = ? AND algorithm = ? AND version = ?
+    `, spec.KeyID, spec.Purpose, spec.Algorithm, version).Scan(&wrapped)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return wrapped, err
 }
 
-// DeleteWrappedKey deletes the wrapped DEK associated with the given key ID.
-func (s *SQLiteStore) DeleteWrappedKey(keyID string) error {
-	res, err := s.db.Exec(`DELETE FROM keys WHERE key_id = ?`, keyID)
+// DeleteWrappedKey deletes all versions for a given KeySpec.
+func (s *SQLiteStore) DeleteWrappedKey(spec kmspec.KeySpec) error {
+	res, err := s.db.Exec(`
+      DELETE FROM `+keysTable+`
+       WHERE key_id = ? AND purpose = ? AND algorithm = ?
+    `, spec.KeyID, spec.Purpose, spec.Algorithm)
 	if err != nil {
 		return err
 	}
@@ -157,25 +162,26 @@ func (s *SQLiteStore) DeleteWrappedKey(keyID string) error {
 	return nil
 }
 
-// ListKeyIDs returns all stored key IDs in the keys table.
-func (s *SQLiteStore) ListKeyIDs() ([]string, error) {
-	rows, err := s.db.Query(
-		"SELECT key_id FROM " + keysTable,
+// ListKeySpecs returns all unique (key_id, purpose, algorithm) tuples.
+func (s *SQLiteStore) ListKeySpecs() ([]kmspec.KeySpec, error) {
+	rows, err := s.db.Query(`
+      SELECT DISTINCT key_id, purpose, algorithm
+        FROM ` + keysTable,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var ids []string
+	var specs []kmspec.KeySpec
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var ks kmspec.KeySpec
+		if err := rows.Scan(&ks.KeyID, &ks.Purpose, &ks.Algorithm); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		specs = append(specs, ks)
 	}
-	return ids, rows.Err()
+	return specs, rows.Err()
 }
 
 // Close closes the underlying database connection.

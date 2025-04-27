@@ -175,10 +175,12 @@ func ensureKeysTable(db *sql.DB) error {
 	const sqlStmt = `
 		CREATE TABLE IF NOT EXISTS keys (
 			key_id      TEXT NOT NULL,
+			purpose     TEXT    NOT NULL,
+  			algorithm   TEXT    NOT NULL,
 			version     INTEGER NOT NULL,
 			wrapped_key BLOB  NOT NULL,
 			created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			PRIMARY KEY (key_id, version)
+			PRIMARY KEY (key_id, purpose, algorithm, version)
 		);`
 	_, err := db.Exec(sqlStmt)
 	return err
