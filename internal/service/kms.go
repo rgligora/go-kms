@@ -2,9 +2,13 @@ package service
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"strconv"
@@ -235,7 +239,89 @@ func (k *KMSService) DecryptData(keyID string, data []byte) ([]byte, error) {
 	return gcm.Open(nil, nonce, ciphertext, versionPrefix)
 }
 
-// TODO: RSA keypair generation, signing, and verification can be added similarly:
-// - Generate an RSA private key, serialize (PKCS#8), wrap and store via store.StoreWrappedKey
-// - Retrieve and unwrap for signing (crypto/rsa.SignPKCS1v15)
-// - Verification can use the extracted public key plus crypto/rsa.VerifyPKCS1v15
+// GenerateRSAKey generates an RSA private key (PKCS#8 DER), wraps it under the masterKey,
+// and stores it as version 1.  Public key isn’t stored separately—the service will derive it
+// from the private when verifying.
+func (k *KMSService) GenerateRSAKey(keyID string, bits int) error {
+	if _, _, err := k.store.LoadLatestWrappedKey(keyID); err == nil {
+		return ErrKeyAlreadyExists
+	} else if !errors.Is(err, ErrKeyNotFound) {
+		return err
+	}
+
+	// 1) Create the RSA keypair
+	priv, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		return err
+	}
+
+	// 2) Marshal to PKCS#8 DER
+	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	defer cryptoutil.Zeroize(privDER)
+
+	// 3) Wrap under masterKey (AES-GCM envelope)
+	wrapped, err := cryptoutil.WrapKey(k.masterKey, privDER)
+	if err != nil {
+		return err
+	}
+
+	return k.store.StoreWrappedKey(keyID, 1, wrapped)
+}
+
+// SignData fetches & unwraps the latest RSA private key for keyID, then returns
+// a PKCS#1 v1.5 signature over SHA-256(message).
+func (k *KMSService) SignData(keyID string, message []byte) ([]byte, error) {
+	wrapped, _, err := k.store.LoadLatestWrappedKey(keyID)
+	if err != nil {
+		return nil, err
+	}
+	privDER, err := cryptoutil.UnwrapKey(k.masterKey, wrapped)
+	if err != nil {
+		return nil, err
+	}
+	defer cryptoutil.Zeroize(privDER)
+
+	// 2) Parse PKCS#8 DER
+	keyIfc, err := x509.ParsePKCS8PrivateKey(privDER)
+	if err != nil {
+		return nil, err
+	}
+	priv, ok := keyIfc.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("not an RSA private key")
+	}
+
+	// 3) Hash & sign
+	h := sha256.Sum256(message)
+	return rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, h[:])
+}
+
+// VerifySignature loads & unwraps the RSA private key, derives its public half,
+// and then verifies that sig is a valid PKCS#1v1.5-SHA256 signature over message.
+func (k *KMSService) VerifySignature(keyID string, message, sig []byte) error {
+	wrapped, _, err := k.store.LoadLatestWrappedKey(keyID)
+	if err != nil {
+		return err
+	}
+	privDER, err := cryptoutil.UnwrapKey(k.masterKey, wrapped)
+	if err != nil {
+		return err
+	}
+	defer cryptoutil.Zeroize(privDER)
+
+	keyIfc, err := x509.ParsePKCS8PrivateKey(privDER)
+	if err != nil {
+		return err
+	}
+	priv, ok := keyIfc.(*rsa.PrivateKey)
+	if !ok {
+		return fmt.Errorf("not an RSA private key")
+	}
+
+	pub := &priv.PublicKey
+	h := sha256.Sum256(message)
+	return rsa.VerifyPKCS1v15(pub, crypto.SHA256, h[:], sig)
+}
