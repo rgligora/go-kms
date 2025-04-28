@@ -157,28 +157,186 @@ go-kms/
 
 ## API Endpoints
 
-| Method | Path                                    | Description                                         |
-| ------ | --------------------------------------- | --------------------------------------------------- |
-| `POST` | `/v1/kms/keys`                          | Create **new** key (version 1).                     |
-| `GET`  | `/v1/kms/keys/{key_id}`                | List **all** wrapped-key versions (`key_versions`). |
-| `DELETE`|`/v1/kms/keys/{key_id}`                | Delete **all** versions of a key.                   |
-| `POST` | `/v1/kms/keys/{key_id}/rotate`         | Rotate to a **new** random DEK version (v+1).       |
-| `POST` | `/v1/kms/keys/{key_id}/recreate`       | Wipe & re-create as version 1 (fresh DEK).          |
-| `POST` | `/v1/kms/encrypt`                      | Encrypt base64-plaintext under latest DEK.          |
-| `POST` | `/v1/kms/decrypt`                      | Decrypt base64-ciphertext (parses `vN:` prefix).    |
 
-### Example: Encrypt / Decrypt
+_All endpoints require mTLS client certificates (localhost-only by default).  
+All requests and responses use JSON (`Content-Type: application/json`)._
 
-```bash
-# Encrypt "Hello"
-PT=$(echo -n "Hello" | base64)
-CT=$(curl -sk .../encrypt      -d "{"key_id":"device123","plaintext":"$PT"}"      | jq -r .ciphertext)
 
-# Decrypt back
-curl -sk .../decrypt   -d "{"key_id":"device123","ciphertext":"$CT"}"   | jq -r .plaintext | base64 --decode
-```
+| Method | Path                             | Description                                         |
+| ------ |----------------------------------|-----------------------------------------------------|
+| `POST` | `/v1/kms/keys`                   | Create **new** key (version 1).                     |
+| `GET`  | `/v1/kms/keys/{key_id}`          | List **all** wrapped-key versions (`key_versions`). |
+| `DELETE`| `/v1/kms/keys/{key_id}`          | Delete **all** versions of a key.                   |
+| `POST` | `/v1/kms/keys/{key_id}/rotate`   | Rotate to a **new** key version (v+1).              |
+| `POST` | `/v1/kms/keys/{key_id}/recreate` | Wipe & re-create as version 1 (fresh key).          |
+| `POST` | `/v1/kms/encrypt`                | Encrypt base64-plaintext under the latest version of DEK. |
+| `POST` | `/v1/kms/decrypt`                | Decrypt base64-ciphertext (parses `vN:` prefix).    |
+| `POST` | `/v1/kms/sign`                   | Sign base64-plaintext under the latest version of DSA key. |
+| `POST` | `/v1/kms/verify`                 | Verify the signature.                               |
+
+
+
+### Key Lifecycle Endpoints
+
+#### Create a New Key
+POST /v1/kms/keys  
+Body:
+{
+"purpose":   "encrypt",         # "encrypt" | "sign"
+"algorithm": "AES-256-GCM"      # "AES-256-GCM" | "ChaCha20-Poly1305" | "RSA-4096" | "ECDSA-P256"
+}
+
+**201 Created**  
+{
+"key_id":    "UUID",
+"purpose":   "encrypt",
+"algorithm": "AES-256-GCM",
+"version":   1
+}
+
+Errors:
+- 400 Bad Request: invalid JSON or missing fields
+- 409 Conflict: "key already exists"
+- 500 Internal Server Error
 
 ---
+
+#### List All Keys
+GET /v1/kms/keys
+
+**200 OK**  
+[
+{
+"key_id":    "UUID",
+"purpose":   "encrypt",
+"algorithm": "AES-256-GCM",
+"version":   2
+},
+{
+"key_id":    "UUID",
+"purpose":   "sign",
+"algorithm": "RSA-4096",
+"version":   1
+}
+]
+
+---
+
+#### Get a Single Key
+GET /v1/kms/keys/{key_id}
+
+**200 OK**  
+(Same schema as one element of the list above)
+
+**404 Not Found**  
+{ "error": "record not found" }
+
+---
+
+#### Delete a Key
+DELETE /v1/kms/keys/{key_id}
+
+**204 No Content**  
+**404 Not Found**
+
+---
+
+#### Rotate a Key
+POST /v1/kms/keys/{key_id}/rotate
+
+**200 OK**  
+{
+"key_id":    "UUID",
+"purpose":   "encrypt",
+"algorithm": "AES-256-GCM",
+"version":   3
+}
+
+**404 Not Found**
+
+---
+
+#### Recreate a Key
+POST /v1/kms/keys/{key_id}/recreate
+
+_Wipes existing versions and issues a new version 1_
+
+**201 Created**  
+(Same schema as Create above, but fresh key_id/version)
+
+**404 Not Found**
+
+---
+
+### Data Operations (RPC-style)
+
+#### Encrypt Data
+POST /v1/kms/encrypt  
+Body:
+{
+"key_id":   "UUID",
+"plaintext":"BASE64-ENCODED"
+}
+
+**200 OK**  
+{ "ciphertext":"BASE64(vN:nonce:ciphertext)" }
+
+Errors:
+- 400 Bad Request (invalid JSON or base64)
+- 500 Internal Server Error
+
+---
+
+#### Decrypt Data
+POST /v1/kms/decrypt  
+Body:
+{
+"key_id":     "UUID",
+"ciphertext": "BASE64(vN:nonce:ciphertext)"
+}
+
+**200 OK**  
+{ "plaintext":"BASE64(original)" }
+
+Errors:
+- 400 Bad Request
+- 500 Internal Server Error
+
+---
+
+#### Sign Data
+POST /v1/kms/sign  
+Body:
+{
+"key_id": "UUID",
+"message":"BASE64(...)"
+}
+
+**200 OK**  
+{ "signature":"BASE64(...)" }
+
+Errors:
+- 400 Bad Request
+- 404 Not Found
+- 500 Internal Server Error
+
+---
+
+#### Verify Signature
+POST /v1/kms/verify  
+Body:
+{
+"key_id":    "UUID",
+"message":   "BASE64(...)",
+"signature": "BASE64(...)"
+}
+
+**200 OK** (success)  
+{ "valid": true }
+
+**200 OK** (failure)  
+{ "valid": false, "error": "signature invalid" }
+
 
 ## Testing
 
