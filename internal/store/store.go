@@ -25,6 +25,15 @@ type MetadataStore interface {
 	SetMasterKeySalt(salt []byte) error
 }
 
+type KeyMetadataStore interface {
+	// CreateKeyMetadata inserts a new row into keys_metadata.
+	CreateKeyMetadata(spec kmspec.KeySpec) error
+	// GetKeyMetadata loads the purpose+algorithm for a given keyID.
+	GetKeyMetadata(keyID string) (kmspec.KeySpec, error)
+	// ListKeySpecs returns all keys’ metadata (key_id, purpose, algorithm).
+	ListKeySpecs() ([]kmspec.KeySpec, error)
+}
+
 // SecretStore defines operations for storing wrapped DEKs and other secrets.
 type SecretStore interface {
 	// StoreWrappedKey saves or updates a wrapped key for the given spec & version.
@@ -37,8 +46,6 @@ type SecretStore interface {
 	LoadWrappedKeyVersion(spec kmspec.KeySpec, version int) ([]byte, error)
 	// DeleteWrappedKey deletes *all* versions for the given spec.
 	DeleteWrappedKey(spec kmspec.KeySpec) error
-	// ListKeySpecs returns all stored key specs.
-	ListKeySpecs() ([]kmspec.KeySpec, error)
 }
 
 // SQLiteStore implements MetadataStore and SecretStore using SQLite.
@@ -52,9 +59,10 @@ func NewSQLiteStore(db *sql.DB) *SQLiteStore {
 }
 
 const (
-	metadataTable = "metadata"
-	saltKey       = "master_key_salt"
-	keysTable     = "keys"
+	metadataTable     = "metadata"
+	saltKey           = "master_key_salt"
+	keysTable         = "keys"
+	keysMetadataTable = "keys_metadata"
 )
 
 // GetMasterKeySalt retrieves the salt from the metadata table.
@@ -162,26 +170,56 @@ func (s *SQLiteStore) DeleteWrappedKey(spec kmspec.KeySpec) error {
 	return nil
 }
 
-// ListKeySpecs returns all unique (key_id, purpose, algorithm) tuples.
+// - KeyMetadataStore implementation
+//
+// CreateKeyMetadata inserts the key’s static metadata.
+func (s *SQLiteStore) CreateKeyMetadata(spec kmspec.KeySpec) error {
+	const sqlStmt = `
+      INSERT INTO ` + keysMetadataTable + ` (key_id, purpose, algorithm)
+           VALUES (?,    ?,       ?)
+      ON CONFLICT(key_id) DO NOTHING;
+    `
+	_, err := s.db.Exec(sqlStmt, spec.KeyID, spec.Purpose, spec.Algorithm)
+	return err
+}
+
+// GetKeyMetadata retrieves the purpose & algorithm for keyID.
+func (s *SQLiteStore) GetKeyMetadata(keyID string) (kmspec.KeySpec, error) {
+	const sqlStmt = `
+      SELECT purpose, algorithm
+        FROM ` + keysMetadataTable + `
+       WHERE key_id = ?
+    `
+	var spec kmspec.KeySpec
+	spec.KeyID = keyID
+	err := s.db.QueryRow(sqlStmt, keyID).Scan(&spec.Purpose, &spec.Algorithm)
+	if err == sql.ErrNoRows {
+		return kmspec.KeySpec{}, ErrNotFound
+	}
+	return spec, err
+}
+
+// ListKeySpecs returns all entries from keys_metadata.
 func (s *SQLiteStore) ListKeySpecs() ([]kmspec.KeySpec, error) {
-	rows, err := s.db.Query(`
-      SELECT DISTINCT key_id, purpose, algorithm
-        FROM ` + keysTable,
-	)
+	const sqlStmt = `
+      SELECT key_id, purpose, algorithm
+        FROM ` + keysMetadataTable + `
+    `
+	rows, err := s.db.Query(sqlStmt)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var specs []kmspec.KeySpec
+	var out []kmspec.KeySpec
 	for rows.Next() {
 		var ks kmspec.KeySpec
 		if err := rows.Scan(&ks.KeyID, &ks.Purpose, &ks.Algorithm); err != nil {
 			return nil, err
 		}
-		specs = append(specs, ks)
+		out = append(out, ks)
 	}
-	return specs, rows.Err()
+	return out, rows.Err()
 }
 
 // Close closes the underlying database connection.
