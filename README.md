@@ -420,16 +420,6 @@ secrets:
 
 ---
 
-## TODO / Roadmap
-
-- [ ] Fine-grained authorization (per-endpoint roles)
-- [ ] Healthz & Prometheus metrics
-- [ ] RSA signing support
-- [ ] Automated key rotation policies
-- [ ] Support for HSM-backed master keys
-
----
-
 ## License
 
 This software is licensed under the PolyForm Noncommercial License 1.0.0.  
