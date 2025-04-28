@@ -14,6 +14,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rgligora/go-kms/internal/config"
 	"github.com/rgligora/go-kms/internal/cryptoutil"
+	"github.com/rgligora/go-kms/internal/kmspec"
 	"github.com/rgligora/go-kms/internal/store"
 	"golang.org/x/term"
 )
@@ -49,6 +50,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("creating keys table: %w", err)
 	}
 
+	if err := ensureKeysMetadataTable(db); err != nil {
+		return nil, fmt.Errorf("creating keys metadata table: %w", err)
+	}
+
 	sqlite := store.NewSQLiteStore(db)
 
 	// 4) Retrieve or generate salt
@@ -74,8 +79,14 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	masterKey := cryptoutil.DeriveMasterKey(passphrase, salt)
 
 	// 6) Validate passphrase or master.key
-	const initKeyID = "__init__"
-	wrappedInit, err := sqlite.LoadWrappedKeyVersion(initKeyID, 1)
+
+	spec := kmspec.KeySpec{
+		KeyID:     "__init__",
+		Purpose:   kmspec.KeyPurpose("encrypt"),
+		Algorithm: kmspec.KeyAlgorithm("AES-256-GCM"),
+	}
+
+	wrappedInit, err := sqlite.LoadWrappedKeyVersion(spec, 1)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, fmt.Errorf("loading init marker: %w", err)
 	}
@@ -86,7 +97,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("wrapping init marker: %w", err)
 		}
-		if err := sqlite.StoreWrappedKey(initKeyID, 1, wrapped); err != nil {
+		if err := sqlite.StoreWrappedKey(spec, 1, wrapped); err != nil {
 			return nil, fmt.Errorf("storing init marker: %w", err)
 		}
 	} else {
@@ -110,14 +121,13 @@ func (s *Server) Run() error {
 	if err != nil {
 		return fmt.Errorf("TLS config error: %w", err)
 	}
-	mux := http.NewServeMux()
+	// Chi router is returned fully‐wired by NewHandler:
 	svc := service.NewKMSService(s.store, s.masterKey)
-	h := handlers.NewHandler(svc)
-	h.RegisterRoutes(mux)
+	router := handlers.NewHandler(svc)
 
 	server := &http.Server{
 		Addr:      fmt.Sprintf("127.0.0.1:%d", s.cfg.Server.Port),
-		Handler:   mux,
+		Handler:   router,
 		TLSConfig: tlsCfg,
 	}
 
@@ -125,7 +135,7 @@ func (s *Server) Run() error {
 	return server.ListenAndServeTLS("", "")
 }
 
-// Close tears down the server: zeroizes the master key and closes DB.
+// Close tears down the server: zeroize the master key and closes DB.
 func (s *Server) Close() error {
 	// Wipe the master key from memory
 	cryptoutil.Zeroize(s.masterKey)
@@ -175,13 +185,23 @@ func ensureKeysTable(db *sql.DB) error {
 	const sqlStmt = `
 		CREATE TABLE IF NOT EXISTS keys (
 			key_id      TEXT NOT NULL,
-			purpose     TEXT    NOT NULL,
-  			algorithm   TEXT    NOT NULL,
 			version     INTEGER NOT NULL,
 			wrapped_key BLOB  NOT NULL,
 			created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			PRIMARY KEY (key_id, purpose, algorithm, version)
+			PRIMARY KEY (key_id, version)
 		);`
+	_, err := db.Exec(sqlStmt)
+	return err
+}
+
+func ensureKeysMetadataTable(db *sql.DB) error {
+	const sqlStmt = `
+      CREATE TABLE IF NOT EXISTS keys_metadata (
+        key_id    TEXT    PRIMARY KEY,
+        purpose   TEXT    NOT NULL,
+        algorithm TEXT    NOT NULL
+      );
+    `
 	_, err := db.Exec(sqlStmt)
 	return err
 }

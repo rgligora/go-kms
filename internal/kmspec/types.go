@@ -1,6 +1,7 @@
 package kmspec
 
 // KeyPurpose is what you’re using the key for:
+// "encrypt" || "sign"
 type KeyPurpose string
 
 const (
@@ -9,6 +10,7 @@ const (
 )
 
 // KeyAlgorithm is the actual algorithm / curve / key size:
+// Supported algorithms "AES-256-GCM" || "ChaCha20-Poly1305" || "RSA-4096" || "ECDSA-P256"
 type KeyAlgorithm string
 
 const (
