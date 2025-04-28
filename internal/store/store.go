@@ -26,8 +26,8 @@ type MetadataStore interface {
 }
 
 type KeyMetadataStore interface {
-	// CreateKeyMetadata inserts a new row into keys_metadata.
-	CreateKeyMetadata(spec kmspec.KeySpec) error
+	// StoreKeyMetadata inserts a new row into keys_metadata.
+	StoreKeyMetadata(spec kmspec.KeySpec) error
 	// GetKeyMetadata loads the purpose+algorithm for a given keyID.
 	GetKeyMetadata(keyID string) (kmspec.KeySpec, error)
 	// ListKeySpecs returns all keys’ metadata (key_id, purpose, algorithm).
@@ -36,16 +36,16 @@ type KeyMetadataStore interface {
 
 // SecretStore defines operations for storing wrapped DEKs and other secrets.
 type SecretStore interface {
-	// StoreWrappedKey saves or updates a wrapped key for the given spec & version.
-	StoreWrappedKey(spec kmspec.KeySpec, version int, wrapped []byte) error
-	// LoadWrappedKey loads *all* versions for the given spec.
-	LoadWrappedKey(spec kmspec.KeySpec) (key []KeyVersion, err error)
-	// LoadLatestWrappedKey loads the latest version for the given spec.
-	LoadLatestWrappedKey(spec kmspec.KeySpec) (wrapped []byte, version int, err error)
-	// LoadWrappedKeyVersion loads a specific version for the given spec.
-	LoadWrappedKeyVersion(spec kmspec.KeySpec, version int) ([]byte, error)
-	// DeleteWrappedKey deletes *all* versions for the given spec.
-	DeleteWrappedKey(spec kmspec.KeySpec) error
+	// StoreWrappedKey saves or updates a wrapped key for the given keyID & version.
+	StoreWrappedKey(keyID string, version int, wrapped []byte) error
+	// LoadWrappedKey loads *all* versions for the given keyID.
+	LoadWrappedKey(keyID string) (key []KeyVersion, err error)
+	// LoadLatestWrappedKey loads the latest version for the given keyID.
+	LoadLatestWrappedKey(keyID string) (wrapped []byte, version int, err error)
+	// LoadWrappedKeyVersion loads a specific version for the given keyID.
+	LoadWrappedKeyVersion(keyID string, version int) ([]byte, error)
+	// DeleteWrappedKey deletes *all* versions for the given keyID.
+	DeleteWrappedKey(keyID string) error
 }
 
 // SQLiteStore implements MetadataStore and SecretStore using SQLite.
@@ -87,24 +87,24 @@ func (s *SQLiteStore) SetMasterKeySalt(salt []byte) error {
 }
 
 // StoreWrappedKey saves or updates a wrapped key in the keys table.
-func (s *SQLiteStore) StoreWrappedKey(spec kmspec.KeySpec, version int, wrapped []byte) error {
+func (s *SQLiteStore) StoreWrappedKey(keyID string, version int, wrapped []byte) error {
 	_, err := s.db.Exec(`
-      INSERT INTO `+keysTable+` (key_id, purpose, algorithm, version, wrapped_key)
-           VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(key_id, purpose, algorithm, version) DO UPDATE
+      INSERT INTO `+keysTable+` (key_id, version, wrapped_key)
+           VALUES (?, ?, ?)
+      ON CONFLICT(key_id, version) DO UPDATE
         SET wrapped_key = excluded.wrapped_key
-    `, spec.KeyID, spec.Purpose, spec.Algorithm, version, wrapped)
+    `, keyID, version, wrapped)
 	return err
 }
 
-// LoadWrappedKey loads *all* versions for a given KeySpec.
-func (s *SQLiteStore) LoadWrappedKey(spec kmspec.KeySpec) ([]KeyVersion, error) {
+// LoadWrappedKey loads *all* versions for a given keyID.
+func (s *SQLiteStore) LoadWrappedKey(keyID string) ([]KeyVersion, error) {
 	rows, err := s.db.Query(`
-      SELECT version, wrapped_key, created_at
+      SELECT version, wrapped_key, last_version_at
         FROM `+keysTable+`
-       WHERE key_id = ? AND purpose = ? AND algorithm = ?
+       WHERE key_id = ?
     ORDER BY version
-    `, spec.KeyID, spec.Purpose, spec.Algorithm)
+    `, keyID)
 	if err != nil {
 		return nil, err
 	}
@@ -124,56 +124,78 @@ func (s *SQLiteStore) LoadWrappedKey(spec kmspec.KeySpec) ([]KeyVersion, error) 
 	return out, rows.Err()
 }
 
-// LoadLatestWrappedKey retrieves the latest wrapped key for a given KeySpec
-func (s *SQLiteStore) LoadLatestWrappedKey(spec kmspec.KeySpec) ([]byte, int, error) {
+// LoadLatestWrappedKey retrieves the latest wrapped key for a given keyID
+func (s *SQLiteStore) LoadLatestWrappedKey(keyID string) ([]byte, int, error) {
 	var wrapped []byte
 	var version int
 	err := s.db.QueryRow(`
       SELECT wrapped_key, version
         FROM `+keysTable+`
-       WHERE key_id = ? AND purpose = ? AND algorithm = ?
+       WHERE key_id = ?
     ORDER BY version DESC
        LIMIT 1
-    `, spec.KeyID, spec.Purpose, spec.Algorithm).Scan(&wrapped, &version)
+    `, keyID).Scan(&wrapped, &version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, 0, ErrNotFound
 	}
 	return wrapped, version, err
 }
 
-// LoadWrappedKeyVersion retrieves a specific version for a given KeySpec.
-func (s *SQLiteStore) LoadWrappedKeyVersion(spec kmspec.KeySpec, version int) ([]byte, error) {
+// LoadWrappedKeyVersion retrieves a specific version for a given keyID.
+func (s *SQLiteStore) LoadWrappedKeyVersion(keyID string, version int) ([]byte, error) {
 	var wrapped []byte
 	err := s.db.QueryRow(`
       SELECT wrapped_key
         FROM `+keysTable+`
-       WHERE key_id = ? AND purpose = ? AND algorithm = ? AND version = ?
-    `, spec.KeyID, spec.Purpose, spec.Algorithm, version).Scan(&wrapped)
+       WHERE key_id = ? AND version = ?
+    `, keyID, version).Scan(&wrapped)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return wrapped, err
 }
 
-// DeleteWrappedKey deletes all versions for a given KeySpec.
-func (s *SQLiteStore) DeleteWrappedKey(spec kmspec.KeySpec) error {
-	res, err := s.db.Exec(`
-      DELETE FROM `+keysTable+`
-       WHERE key_id = ? AND purpose = ? AND algorithm = ?
-    `, spec.KeyID, spec.Purpose, spec.Algorithm)
+// DeleteWrappedKey deletes all versions for a given keyID with metadata.
+func (s *SQLiteStore) DeleteWrappedKey(keyID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	// ensure we roll back on any error
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// 1) delete all versions
+	res, err := tx.Exec(`
+        DELETE FROM `+keysTable+`
+        WHERE key_id = ?
+    `, keyID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
-	return nil
+
+	// 2) delete the metadata row too
+	if _, err = tx.Exec(`
+        DELETE FROM `+keysMetadataTable+`
+        WHERE key_id = ?
+    `, keyID); err != nil {
+		return err
+	}
+
+	// 3) commit both deletes together
+	return tx.Commit()
 }
 
 // - KeyMetadataStore implementation
 //
-// CreateKeyMetadata inserts the key’s static metadata.
-func (s *SQLiteStore) CreateKeyMetadata(spec kmspec.KeySpec) error {
+// StoreKeyMetadata inserts the key’s static metadata.
+func (s *SQLiteStore) StoreKeyMetadata(spec kmspec.KeySpec) error {
 	const sqlStmt = `
       INSERT INTO ` + keysMetadataTable + ` (key_id, purpose, algorithm)
            VALUES (?,    ?,       ?)

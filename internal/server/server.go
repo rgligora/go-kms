@@ -25,6 +25,7 @@ type Server struct {
 	db        *sql.DB
 	store     *store.SQLiteStore
 	masterKey []byte
+	svc       *service.KMSService
 }
 
 // NewServer bootstraps the KMS server: loads passphrase, derives master key, initializes storage.
@@ -56,6 +57,14 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 	sqlite := store.NewSQLiteStore(db)
 
+	combined := struct {
+		store.SecretStore
+		store.KeyMetadataStore
+	}{
+		SecretStore:      sqlite,
+		KeyMetadataStore: sqlite,
+	}
+
 	// 4) Retrieve or generate salt
 	salt, err := sqlite.GetMasterKeySalt()
 	if err != nil {
@@ -86,7 +95,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		Algorithm: kmspec.KeyAlgorithm("AES-256-GCM"),
 	}
 
-	wrappedInit, err := sqlite.LoadWrappedKeyVersion(spec, 1)
+	wrappedInit, err := sqlite.LoadWrappedKeyVersion(spec.KeyID, 1)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return nil, fmt.Errorf("loading init marker: %w", err)
 	}
@@ -97,7 +106,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("wrapping init marker: %w", err)
 		}
-		if err := sqlite.StoreWrappedKey(spec, 1, wrapped); err != nil {
+		if err := sqlite.StoreWrappedKey(spec.KeyID, 1, wrapped); err != nil {
 			return nil, fmt.Errorf("storing init marker: %w", err)
 		}
 	} else {
@@ -112,6 +121,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		db:        db,
 		store:     sqlite,
 		masterKey: masterKey,
+		svc:       service.NewKMSService(combined, masterKey),
 	}, nil
 }
 
@@ -121,9 +131,7 @@ func (s *Server) Run() error {
 	if err != nil {
 		return fmt.Errorf("TLS config error: %w", err)
 	}
-	// Chi router is returned fully‐wired by NewHandler:
-	svc := service.NewKMSService(s.store, s.masterKey)
-	router := handlers.NewHandler(svc)
+	router := handlers.NewHandler(s.svc)
 
 	server := &http.Server{
 		Addr:      fmt.Sprintf("127.0.0.1:%d", s.cfg.Server.Port),
@@ -187,7 +195,7 @@ func ensureKeysTable(db *sql.DB) error {
 			key_id      TEXT NOT NULL,
 			version     INTEGER NOT NULL,
 			wrapped_key BLOB  NOT NULL,
-			created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			last_version_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (key_id, version)
 		);`
 	_, err := db.Exec(sqlStmt)
@@ -199,7 +207,8 @@ func ensureKeysMetadataTable(db *sql.DB) error {
       CREATE TABLE IF NOT EXISTS keys_metadata (
         key_id    TEXT    PRIMARY KEY,
         purpose   TEXT    NOT NULL,
-        algorithm TEXT    NOT NULL
+        algorithm TEXT    NOT NULL,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `
 	_, err := db.Exec(sqlStmt)
